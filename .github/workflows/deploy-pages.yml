@@ -30,6 +30,7 @@ jobs:
           set -euo pipefail
           mkdir -p _site/assets/mediapipe/wasm _site/assets/mediapipe/model
           cp index.html _site/index.html
+          cp diagnostic.html _site/diagnostic.html
           touch _site/.nojekyll
           # Use a known published version, pinned and copied into this site's origin.
           package_archive="$(npm pack @mediapipe/tasks-vision@0.10.21 --silent)"
