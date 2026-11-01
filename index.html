@@ -217,7 +217,7 @@ class ChewDetector {
     // the cycle was actually counted (cooldown or head-motion guard may block it).
     const personal=this.personalClosedSignal(m,nowMs,!headShift);
     const personalHit=!!this.profile && personal.detected;
-    const genericOpenHit=!this.above && openExceeded;
+    const genericOpenHit=!this.profile && !this.above && openExceeded;
     const genericClosedHit=!this.profile && !this.closedAbove && closedExceeded;
     let chewed=false,kind=null;
     if(!stable){
@@ -236,37 +236,59 @@ class ChewDetector {
       score:Math.max(this.smoothed/openLimit,this.closedSmoothed/closedLimit,personal.signal||0),
       threshold:1,headShift:!stable};
   }
-  // Personal learning takes separate labeled samples: 2 seconds still, then 7 seconds chewing closed.
-  // Select the channel with best movement-to-rest noise separation, never a guessed universal threshold.
-  learnClosedProfile(still,chewing){
-    if(still.length<8 || chewing.length<20)return {ok:false,reason:'Chưa đủ khung hình để học.'};
-    const choices=[];
-    for(const key of ChewDetector.PERSONAL_CHANNELS){
-      const a=still.map(m=>m[key]).filter(Number.isFinite);
-      const b=chewing.map(m=>m[key]).filter(Number.isFinite);
-      if(a.length<8 || b.length<20)continue;
-      const center=quantile(a,.5);
-      const noise=quantile(a.map(v=>Math.abs(v-center)),.95);
-      const upper=quantile(b,.9)-center;
-      const lower=center-quantile(b,.1);
-      const amplitude=Math.max(upper,lower);
-      // Exclude dimensions where apparent movement is indistinguishable from jitter.
-      if(amplitude<Math.max(.00025,noise*1.65))continue;
-      const polarity=upper>=lower?1:-1;
-      const separation=amplitude/Math.max(noise,.00015);
-      const range=quantile(b,.9)-quantile(b,.1);
-      choices.push({key,polarity,amplitude,noise,separation,range,center});
+  // Same online peak detector as diagnostic.html: repeated events, not one large offset.
+  countClosedCycles(records,key,polarity,threshold){
+    let baseline=null,lastT=null,smoothed=0,armed=true,lastCount=-Infinity,count=0,peak=0;
+    for(let i=0;i<records.length;i++){
+      const item=records[i],value=item[key],t=Number.isFinite(item.t)?item.t:i*67;
+      if(!Number.isFinite(value))continue;
+      if(baseline===null){baseline=value;lastT=t;continue;}
+      const dt=clamp(t-lastT,25,180);lastT=t;
+      const signed=(value-baseline)*polarity;
+      baseline+=(1-Math.exp(-dt/850))*(value-baseline);
+      smoothed=smoothed*.26+signed*.74;
+      peak=Math.max(peak,smoothed);
+      if(smoothed<threshold*.20)armed=true;
+      if(armed&&smoothed>threshold&&t-lastCount>=240){
+        count++;lastCount=t;armed=false;
+      }
     }
-    choices.sort((a,b)=>b.separation-a.separation || b.range-a.range);
-    if(!choices.length)return {ok:false,reason:'Không tìm thấy chuyển động hàm khác biệt rõ với khi giữ yên. Hãy thử đủ ánh sáng, giữ iPhone cố định, nhai kín miệng rõ ràng.'};
-    const best=choices[0];
-    const profile={key:best.key,polarity:best.polarity,threshold:Math.max(best.noise*1.35,best.amplitude*.23,.00022),amplitude:best.amplitude,noise:best.noise,version:1};
+    return {count,peak};
+  }
+  // Reject training that lacks repeated jaw cycles; never silently save an ineffective profile.
+  learnClosedProfile(still,chewing){
+    if(still.length<8||chewing.length<20)return {ok:false,reason:'Chưa đủ khung hình để học.'};
+    const candidates=[],middle=Math.floor(chewing.length/2);
+    for(const key of ChewDetector.PERSONAL_CHANNELS){
+      const a=still.map(x=>x[key]).filter(Number.isFinite);
+      const b=chewing.map(x=>x[key]).filter(Number.isFinite);
+      if(a.length<8||b.length<20)continue;
+      const center=quantile(a,.5),noise=quantile(a.map(x=>Math.abs(x-center)),.95);
+      const range=quantile(b,.9)-quantile(b,.1);
+      const threshold=Math.max(.00025,noise*1.35,range*.23);
+      const plus=this.countClosedCycles(chewing,key,1,threshold);
+      const minus=this.countClosedCycles(chewing,key,-1,threshold);
+      const polarity=plus.count>=minus.count?1:-1,cycles=Math.max(plus.count,minus.count);
+      const restCycles=this.countClosedCycles(still,key,polarity,threshold).count;
+      const first=this.countClosedCycles(chewing.slice(0,middle),key,polarity,threshold).count;
+      const second=this.countClosedCycles(chewing.slice(middle),key,polarity,threshold).count;
+      if(cycles<4||restCycles!==0||first<2||second<2)continue;
+      candidates.push({key,polarity,threshold,cycles,restCycles,noise,range});
+    }
+    const prefer={jaw:3,chinY:2,lip:1};
+    candidates.sort((a,b)=>b.cycles-a.cycles||(prefer[b.key]||0)-(prefer[a.key]||0)||
+      b.range/Math.max(b.noise,.00001)-a.range/Math.max(a.noise,.00001));
+    if(!candidates.length)return {ok:false,reason:'Không tìm thấy đủ chu kỳ nhai lặp lại. Mẫu cũ được giữ nguyên; KHÔNG lưu mẫu chưa đạt.'};
+    const best=candidates[0];
+    const profile={key:best.key,polarity:best.polarity,threshold:best.threshold,
+      version:2,source:'cycle-validation',verifiedCycles:best.cycles};
     this.setProfile(profile);
-    return {ok:true,profile,rank:choices.slice(0,3)};
+    return {ok:true,profile,rank:candidates.slice(0,3)};
   }
   setProfile(p){
     if(!p || !ChewDetector.PERSONAL_CHANNELS.includes(p.key) || ![-1,1].includes(p.polarity) || !Number.isFinite(p.threshold) || p.threshold<=0)return false;
-    this.profile={key:p.key,polarity:p.polarity,threshold:clamp(p.threshold,.0001,.30),version:1};
+    this.profile={key:p.key,polarity:p.polarity,threshold:clamp(p.threshold,.0001,.30),
+      version:p.version===2?2:1,source:p.source||'legacy',verifiedCycles:p.verifiedCycles||null};
     this.personalBaseline=null;this.personalSmoothed=0;this.personalArmed=true;this.personalLastTime=null;
     return true;
   }
@@ -323,7 +345,20 @@ const modelURL = new URL('./assets/mediapipe/model/face_landmarker.task', docume
 const wasmRoot = new URL('./assets/mediapipe/wasm', document.baseURI).href;
 const saved = (()=>{ try{return JSON.parse(localStorage.getItem(configKey) || '{}');}catch{return {};} })();
 const detector = new ChewDetector();
-try{const savedClosedProfile=JSON.parse(localStorage.getItem(closedProfileKey)||'null');if(savedClosedProfile)detector.setProfile(savedClosedProfile);}catch{}
+// User's verified iPhone diagnostic: rejected rightJawY threshold 0.049582 (>0.019546 measured peak).
+// Restore the exact user-specific jaw signal: 10 estimated cycles and zero idle false peaks.
+try{
+  const savedClosedProfile=JSON.parse(localStorage.getItem(closedProfileKey)||'null');
+  if(savedClosedProfile?.key==='rightJawY'&&savedClosedProfile.polarity===-1&&
+    Number.isFinite(savedClosedProfile.threshold)&&Math.abs(savedClosedProfile.threshold-.049582)<.00001){
+    const backupKey=closedProfileKey+'-backup-before-diagnostic';
+    if(!localStorage.getItem(backupKey))localStorage.setItem(backupKey,JSON.stringify(savedClosedProfile));
+    const corrected={key:'jaw',polarity:1,threshold:.011766,version:2,
+      source:'diagnostic-20261102',verifiedCycles:10};
+    detector.setProfile(corrected);
+    localStorage.setItem(closedProfileKey,JSON.stringify(corrected));
+  }else if(savedClosedProfile)detector.setProfile(savedClosedProfile);
+}catch{}
 const state = {
   source: 'youtube', yt: null, ytReady: false, ytId: '', ytApiReady: false,
   mediaURL: null, cameraStream: null, landmarker: null, detecting: false,
@@ -532,7 +567,10 @@ async function startTracking(){
     state.lastInferenceMs=0;state.modelLoading=false;
     $('cameraBadge').textContent='Đang hoạt động';$('cameraBadge').classList.add('active');
     $('stopCamera').disabled=false;$('trainClosed').disabled=false;
-    $('trainClosedInfo').textContent=detector.profile?'Đã có mẫu nhai kín được học trên thiết bị. Có thể bấm để học lại.':'Camera sẵn sàng. Bấm Học nhai kín miệng để ghi nhận chuyển động hàm thực tế (không lưu hình).';
+    $('trainClosedInfo').textContent=detector.profile?.source==='diagnostic-20261102'?
+      'Đã áp dụng số đo iPhone: jaw (+), ngưỡng 0,011766; mẫu rightJawY lỗi được sao lưu. Thử nhai kín 10 lần, KHÔNG cần học lại.':
+      detector.profile?'Đã có mẫu nhai kín được học trên thiết bị. Có thể bấm để học lại.':
+      'Camera sẵn sàng. Bấm Học nhai kín miệng để ghi nhận chuyển động hàm thực tế (không lưu hình).';
     trackerStatus('Nhìn vào camera và giữ yên 3 giây…');
     detectLoop(state.trackerSession);
   } catch(err){
@@ -569,8 +607,9 @@ function detectLoop(session){
       if(state.closedTraining){
         const t=state.closedTraining,elapsed=now-t.start;
         if(measures){
-          if(elapsed<2300)t.still.push(measures);
-          else if(elapsed<9600)t.chewing.push(measures);
+          const timed={...measures,t:now};
+          if(elapsed<2300)t.still.push(timed);
+          else if(elapsed<9600)t.chewing.push(timed);
         }
         const remaining=Math.max(0,Math.ceil((9600-elapsed)/1000));
         if(elapsed<2300)trackerStatus('Học nhai kín: giữ yên mặt '+remaining+' giây');
@@ -580,7 +619,9 @@ function detectLoop(session){
           const result=detector.learnClosedProfile(t.still,t.chewing);
           if(result.ok){
             try{localStorage.setItem(closedProfileKey,JSON.stringify(result.profile));}catch{}
-            $('trainClosedInfo').textContent='Đã học chuyển động nhai kín từ tín hiệu '+result.profile.key+' trên thiết bị này; không lưu ảnh. Hãy nhai thử để kiểm tra.';
+            $('trainClosedInfo').textContent='Đã học từ '+result.profile.verifiedCycles+
+              ' chu kỳ ước lượng qua tín hiệu '+result.profile.key+
+              ' (không đếm nhầm lúc giữ yên). Không lưu ảnh; hãy kiểm thử 10 lần nhai thật.';
             trackerStatus('Đã học nhai kín. Thử nhai và xem bộ đếm.');
           }else{trackerStatus('Chưa học được: '+result.reason);$('trainClosedInfo').textContent=result.reason;}
         }
