@@ -118,91 +118,123 @@ function metricsFromFace(points) {
 class ChewDetector {
   constructor({ sensitivity = 1 } = {}) { this.sensitivity = sensitivity; this.reset(); }
   reset() {
-    this.ready = false; this.restStartMs = null; this.rest = null; this.restFrames = [];
-    this.previous = null; this.lastChewMs = -Infinity; this.chews = 0;
-    this.threshold = 0.026; this.above = false; this.smoothed = 0;
-    this.closedThreshold = .006; this.closedSmoothed=0; this.closedHits=0; this.closedAbove=false;
-    this.lastMetrics = null; this.lastFaceMs = -Infinity;
+    this.ready=false; this.restStartMs=null; this.rest=null; this.restFrames=[];
+    this.previous=null; this.chews=0; this.lastChewMs=-Infinity;
+    this.threshold=.026; this.smoothed=0; this.above=false;
+    this.closedThreshold=.003; this.closedSmoothed=0; this.closedHits=0; this.closedAbove=false;
+    this.closedBaseline=null; this.closedPolarity=0; this.lastMetrics=null; this.lastFaceMs=-Infinity;
+    this.motionGuardUntil=-Infinity;
   }
-  setSensitivity(value) { this.sensitivity = clamp(Number(value) || 1, 0.6, 1.6); }
+  setSensitivity(value) { this.sensitivity=clamp(Number(value)||1,.6,1.6); }
   update(m, nowMs) {
     if (!m || Object.values(m).some(v => !Number.isFinite(v))) {
-      return { face: false, ready: this.ready, chewed: false, count: this.chews };
+      // Missing landmarks are not chewing. Keep the user's counted chews.
+      if(nowMs-this.lastFaceMs>950 && this.ready){
+        this.previous=null;this.above=false;this.closedAbove=false;this.closedHits=0;
+      }
+      return {face:false,ready:this.ready,chewed:false,count:this.chews};
     }
-    this.lastFaceMs = nowMs;
-    if (this.restStartMs === null) this.restStartMs = nowMs;
-    if (!this.ready) {
+    const previousSeen=this.lastFaceMs;
+    this.lastFaceMs=nowMs;
+    if(this.restStartMs===null)this.restStartMs=nowMs;
+    if(!this.ready){
       this.restFrames.push(m);
-      if (this.restFrames.length > 160) this.restFrames.shift();
-      const elapsed = nowMs - this.restStartMs;
-      if (elapsed >= 3000 && this.restFrames.length >= 16) {
-        this.rest = {
-          gap: quantile(this.restFrames.map(x => x.gap), 0.5),
-          lip: quantile(this.restFrames.map(x => x.lip), 0.5),
-          jaw: quantile(this.restFrames.map(x => x.jaw), 0.5),
-        };
-        const channels=['cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan'];
-        for(const key of channels){
+      if(this.restFrames.length>160)this.restFrames.shift();
+      const elapsed=nowMs-this.restStartMs;
+      if(elapsed>=3000 && this.restFrames.length>=16){
+        const keys=['gap','lip','jaw',...ChewDetector.CLOSED_CHANNELS];
+        this.rest={};
+        for(const key of keys){
           const values=this.restFrames.map(v=>v[key]).filter(Number.isFinite);
           if(values.length>=16)this.rest[key]=quantile(values,.5);
         }
-        const closedNoise=this.restFrames.map(x=>this.closedMovement(x));
-        this.closedThreshold=clamp(Math.max(.006,quantile(closedNoise,.95)*3.0),.006,.065);
-        const noise = this.restFrames.map(x => this.movement(x));
-        this.threshold = clamp(Math.max(0.017, quantile(noise, 0.95) * 2.8), 0.017, 0.14);
-        this.ready = true;
-        this.previous = m;
+        this.closedBaseline={};
+        for(const k of ChewDetector.CLOSED_CHANNELS)this.closedBaseline[k]=this.rest[k];
+        const closedNoise=this.restFrames.map(v=>this.closedDeviation(v,this.rest));
+        this.closedThreshold=clamp(Math.max(.0028,quantile(closedNoise,.95)*2.2),.0028,.045);
+        const noise=this.restFrames.map(v=>this.movement(v));
+        this.threshold=clamp(Math.max(.017,quantile(noise,.95)*2.8),.017,.14);
+        this.ready=true; this.previous=m;
       }
-      return { face: true, ready: this.ready, calibrating: !this.ready,
-        calibrationProgress: clamp(elapsed / 3000, 0, 1), chewed: false, count: this.chews,
-        score: 0, threshold: this.threshold };
+      return {face:true,ready:this.ready,calibrating:!this.ready,
+        calibrationProgress:clamp(elapsed/3000,0,1),chewed:false,count:this.chews,
+        score:0,threshold:this.threshold};
     }
-    const p = this.previous;
-    this.previous = m;
-    const headShift = p && (Math.hypot(m.headX-p.headX, m.headY-p.headY) > 0.030 ||
-      Math.abs(m.headScale-p.headScale)/Math.max(m.headScale, .01) > 0.035);
-    // Mild smoothing limits noisy mouth landmark crossings.
-    const raw = this.movement(m);
-    this.smoothed = this.smoothed * 0.36 + raw * 0.64;
-    const threshold = this.threshold / this.sensitivity;
-    const exceeded = this.smoothed > threshold;
-    const closedRaw=this.closedMovement(m);
-    this.closedSmoothed=this.closedSmoothed*.38+closedRaw*.62;
+    const p=this.previous;
+    this.previous=m;
+    const recoveredFace=this.ready && !p;
+    const headShift=recoveredFace || ( !!p && (Math.hypot(m.headX-p.headX,m.headY-p.headY)>.020 ||
+      Math.abs(m.headScale-p.headScale)/Math.max(m.headScale,.01)>.028) );
+    if(headShift){
+      this.motionGuardUntil=nowMs+200;
+      // Drop geometry from the old pose, rather than treating a turned head as jaw motion.
+      for(const key of ChewDetector.CLOSED_CHANNELS)this.closedBaseline[key]=m[key];
+      this.closedSmoothed=0; this.closedHits=0; this.closedAbove=false; this.closedPolarity=0;
+    }
+    const raw=this.movement(m);
+    this.smoothed=this.smoothed*.36+raw*.64;
+    const openLimit=this.threshold/this.sensitivity;
+    const openExceeded=this.smoothed>openLimit;
+    let closedRaw=0;
+    if(!headShift){
+      // High-pass geometry: compare fast facial motion with a slow moving baseline.
+      // Unlike absolute distance from the original calibration pose, this re-arms
+      // when the jaw changes position without fully returning to the starting pose.
+      closedRaw=this.closedSignedDeviation(m,this.closedBaseline);
+      const dt=Math.max(25,Math.min(220,nowMs-(Number.isFinite(previousSeen)?previousSeen:nowMs-80)));
+      const alpha=1-Math.exp(-dt/620);
+      for(const key of ChewDetector.CLOSED_CHANNELS){
+        this.closedBaseline[key]+=alpha*(m[key]-this.closedBaseline[key]);
+      }
+    }
+    this.closedSmoothed=this.closedSmoothed*.28+closedRaw*.72;
     const closedLimit=this.closedThreshold/this.sensitivity;
-    // Closed-mouth detection needs two consecutive frames and no visible head translation.
-    if(this.closedSmoothed>closedLimit && !headShift)this.closedHits++;
+    const stable=nowMs>=this.motionGuardUntil;
+    if(stable && Math.abs(this.closedSmoothed)>closedLimit)this.closedHits++;
     else this.closedHits=0;
-    const closedExceeded=this.closedHits>=2 && this.closedSmoothed>closedLimit;
-    let chewed = false, kind=null;
-    if (headShift) {
-      // Do not count a head movement as a chew.
-      this.above = exceeded;this.closedAbove=closedExceeded;
-    } else if (!this.above && !this.closedAbove && (exceeded || closedExceeded) && nowMs - this.lastChewMs > 370) {
-      this.chews++; this.lastChewMs = nowMs; this.above = exceeded; this.closedAbove=closedExceeded; chewed = true;
-      kind=exceeded?'open':'closed';
-    } else {
-      if (this.above && this.smoothed < threshold * 0.57) this.above = false;
-      if(this.closedAbove && this.closedSmoothed<closedLimit*.52)this.closedAbove=false;
+    const closedExceeded=stable && this.closedHits>=2 && Math.abs(this.closedSmoothed)>closedLimit &&
+      (this.closedPolarity===0 || Math.sign(this.closedSmoothed)===this.closedPolarity || nowMs-this.lastChewMs>1500);
+    let chewed=false,kind=null;
+    if(!stable){
+      this.above=openExceeded;
+    }else if(!this.above && !this.closedAbove && (openExceeded || closedExceeded) && nowMs-this.lastChewMs>=280){
+      this.chews++; this.lastChewMs=nowMs;
+      this.above=openExceeded; this.closedAbove=closedExceeded;
+      chewed=true; kind=openExceeded?'open':'closed';
+      if(kind==='closed')this.closedPolarity=Math.sign(this.closedSmoothed)||1;
+    }else{
+      if(this.above && this.smoothed<openLimit*.62)this.above=false;
+      if(this.closedAbove && this.closedSmoothed*this.closedPolarity<closedLimit*.15)this.closedAbove=false;
     }
-    return { face: true, ready: true, calibrating: false, chewed, count: this.chews,kind,
-      score: Math.max(this.smoothed,this.closedSmoothed), threshold: Math.max(threshold,closedLimit), headShift: !!headShift };
+    return {face:true,ready:true,calibrating:false,chewed,count:this.chews,kind,
+      score:Math.max(this.smoothed/openLimit,this.closedSmoothed/closedLimit),
+      threshold:1,headShift:!stable};
   }
-  closedMovement(m){
+  closedDeviation(m,base){
+    if(!base)return 0;
+    const ch=ChewDetector.CLOSED_CHANNELS;
+    if(ch.some(key=>!Number.isFinite(m[key])||!Number.isFinite(base[key])))return 0;
+    const delta=key=>Math.abs(m[key]-base[key]);
+    return .35*(delta('cornerL')+delta('cornerR'))+.28*(delta('lowerL')+delta('lowerR'))+
+      .20*delta('jawSpan')+.16*delta('cheekSpan');
+  }
+  closedSignedDeviation(m,base){
+    if(!base)return 0;
+    const ch=ChewDetector.CLOSED_CHANNELS;
+    if(ch.some(key=>!Number.isFinite(m[key])||!Number.isFinite(base[key])))return 0;
+    const delta=key=>m[key]-base[key];
+    return .35*(delta('cornerL')+delta('cornerR'))+.28*(delta('lowerL')+delta('lowerR'))+
+      .20*delta('jawSpan')+.16*delta('cheekSpan');
+  }
+  closedMovement(m){return this.closedDeviation(m,this.rest);}
+  movement(m){
     if(!this.rest)return 0;
-    const ch=['cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan'];
-    if(ch.some(key=>!Number.isFinite(m[key]) || !Number.isFinite(this.rest[key])))return 0;
-    const delta=key=>Math.abs(m[key]-this.rest[key]);
-    return .35*(delta('cornerL')+delta('cornerR')) + .28*(delta('lowerL')+delta('lowerR'))
-      + .20*delta('jawSpan') + .16*delta('cheekSpan');
-  }
-  movement(m) {
-    if (!this.rest) return 0;
-    return Math.abs(m.gap-this.rest.gap)*0.73 +
-      Math.abs(m.lip-this.rest.lip)*0.54 +
-      Math.abs(m.jaw-this.rest.jaw)*0.40;
+    return Math.abs(m.gap-this.rest.gap)*.73+
+      Math.abs(m.lip-this.rest.lip)*.54+
+      Math.abs(m.jaw-this.rest.jaw)*.40;
   }
 }
-
+ChewDetector.CLOSED_CHANNELS=Object.freeze(['cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan']);
 
 
 const $ = id => document.getElementById(id);
@@ -445,7 +477,7 @@ function stopTracking(){
 function detectLoop(session){
   if(!state.tracking || session!==state.trackerSession)return;
   const now=performance.now();const camera=$('cameraPreview');
-  if(camera.readyState>=2 && now-state.lastInferenceMs>85){
+  if(camera.readyState>=2 && now-state.lastInferenceMs>60){
     state.lastInferenceMs=now;
     try{
       const result=state.landmarker.detectForVideo(camera,now);
