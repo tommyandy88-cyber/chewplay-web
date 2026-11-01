@@ -192,7 +192,7 @@ function setSettings(){
 }
 function setSource(source) {
   if (source===state.source) return;
-  pauseMedia(); state.pausedByChew=false; state.playedOnce=false;
+  pauseMedia(); state.pausedByChew=false; state.playedOnce=false; state.lastChewMs=null;
   state.source = source;
   const yt=source==='youtube';
   $('youtubeTab').classList.toggle('active',yt);$('localTab').classList.toggle('active',!yt);
@@ -217,7 +217,7 @@ function extractVideoId(value) {
 function loadYoutube(value){
   const id=extractVideoId(value);
   if(!id){note('Link chưa hợp lệ. Dán URL YouTube dạng youtube.com/watch?v=… hoặc youtu.be/…');return;}
-  state.ytId=id; state.playedOnce=false; state.pausedByChew=false; storeSettings();
+  state.ytId=id; state.playedOnce=false; state.pausedByChew=false; state.lastChewMs=null; storeSettings();
   $('youtubePlaceholder').classList.add('hidden');
   if(state.ytReady){state.yt.cueVideoById(id);note('Đã tải video. Nhấn Play bên trong YouTube để bắt đầu.');}
   else if(window.YT && window.YT.Player){createYoutubePlayer();}
@@ -229,7 +229,7 @@ function createYoutubePlayer(){
     playerVars:{playsinline:1,controls:1,rel:0,origin:location.origin},
     events:{onReady(){state.ytReady=true;state.yt.cueVideoById(state.ytId);note('Nhấn Play bên trong YouTube để cấp quyền phát tiếng.');},
       onStateChange(event){
-        if(event.data===YT.PlayerState.PLAYING){state.playedOnce=true;if(state.tracking && detector.ready && state.lastChewMs===null)state.lastChewMs=performance.now();if(!state.pausedByChew)note('Video đang phát. Hãy bật camera để kiểm soát theo nhai.');}
+        if(event.data===YT.PlayerState.PLAYING){state.playedOnce=true;state.lastChewMs=performance.now();if(!state.pausedByChew)note('Video đang phát. Hãy bật camera để kiểm soát theo nhai.');}
         if(event.data===YT.PlayerState.ENDED){state.pausedByChew=false;state.playedOnce=false;}
         // A deliberate manual pause should not unexpectedly restart.
         if(event.data===YT.PlayerState.PAUSED && !state.pausedByChew){state.playedOnce=false;}
@@ -254,10 +254,12 @@ function resumeMedia(){
   }
 }
 function runChewControl(now){
-  if(!state.tracking || !$('autoControl').checked || !state.playedOnce || !state.lastChewMs)return;
+  if(!$('autoControl').checked || !state.playedOnce)return;
+  // Start inactivity counting even before calibration or when no face is visible.
+  if(state.lastChewMs===null)state.lastChewMs=now;
   const idleMs=Number($('idleSeconds').value)*1000;
   if(!state.pausedByChew && isPlaying() && now-state.lastChewMs>=idleMs) {
-    state.pausedByChew=true;pauseMedia();note('Đã tạm dừng vì chưa phát hiện nhai. Nhai tiếp để thử phát lại.');
+    state.pausedByChew=true;pauseMedia();note(state.tracking ? 'Đã tạm dừng vì chưa phát hiện nhai. Nhai tiếp để thử phát lại.' : 'Đã tạm dừng vì chưa phát hiện nhai. Bật camera để nhận diện nhai.');
   }
 }
 function onChew(now){
@@ -332,7 +334,6 @@ function detectLoop(session){
       }
     }catch(e){trackerStatus('Lỗi Face Mesh: '+(e?.message||'không rõ'));}
   }
-  runChewControl(now);
   requestAnimationFrame(()=>detectLoop(session));
 }
 
@@ -344,9 +345,9 @@ $('localFile').addEventListener('change',e=>{
   if(state.mediaURL)URL.revokeObjectURL(state.mediaURL);
   state.mediaURL=URL.createObjectURL(file);
   $('localPlayer').src=state.mediaURL;$('localPlaceholder').classList.add('hidden');
-  state.playedOnce=false;state.pausedByChew=false;note('Đã chọn '+file.name+'. Nhấn Play trên trình phát.');
+  state.playedOnce=false;state.pausedByChew=false;state.lastChewMs=null;note('Đã chọn '+file.name+'. Nhấn Play trên trình phát.');
 });
-$('localPlayer').addEventListener('play',()=>{if(state.source==='local'){state.playedOnce=true;if(state.tracking && detector.ready && state.lastChewMs===null)state.lastChewMs=performance.now();}});
+$('localPlayer').addEventListener('play',()=>{if(state.source==='local'){state.playedOnce=true;state.lastChewMs=performance.now();}});
 $('localPlayer').addEventListener('pause',()=>{if(state.source==='local'&&!state.pausedByChew)state.playedOnce=false;});
 $('localPlayer').addEventListener('ended',()=>{state.playedOnce=false;state.pausedByChew=false;});
 $('startCamera').addEventListener('click',startTracking);$('stopCamera').addEventListener('click',stopTracking);
@@ -355,8 +356,10 @@ $('sensitivity').addEventListener('input',()=>{
   const s=Number($('sensitivity').value);detector.setSensitivity(s);
   $('sensitivityText').textContent=s<.9?'Thấp':s>1.1?'Cao':'Bình thường';storeSettings();
 });
-$('autoControl').addEventListener('change',()=>{state.pausedByChew=false;storeSettings();});
+$('autoControl').addEventListener('change',()=>{state.pausedByChew=false;state.lastChewMs=null;storeSettings();});
 $('resetCount').addEventListener('click',()=>{detector.reset();$('chewCount').textContent='0';state.lastChewMs=null;trackerStatus(state.tracking?'Đang hiệu chỉnh lại (3 giây)…':'Đã xóa lượt nhai');});
+// Independent watchdog: video must pause even when the camera is off or Face Landmarker has not loaded.
+setInterval(()=>runChewControl(performance.now()),200);
 window.addEventListener('pagehide',()=>{stopTracking();if(state.mediaURL) URL.revokeObjectURL(state.mediaURL);});
 setSettings();
 if(saved.videoId && /^[a-zA-Z0-9_-]{11}$/.test(saved.videoId)){
