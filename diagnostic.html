@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ChewPlay — Kiểm tra nhai kín</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;color:#20393a;background:#faf9f4}*{box-sizing:border-box}body{margin:0}.wrap{max-width:620px;margin:0 auto;padding:20px 16px 48px}h1{font-size:23px}p{line-height:1.6}h2{font-size:18px}article{background:white;padding:17px;border-radius:18px;border:1px solid #dfebe5;margin:14px 0}button{background:#2d6866;color:white;border:0;border-radius:13px;min-height:48px;padding:12px 15px;font-size:16px;font-weight:650;cursor:pointer}button:disabled{opacity:.5}.muted{font-size:13px;color:#586c68}#camera{background:#183331;border-radius:14px;width:100%;aspect-ratio:4/3;object-fit:cover;transform:scaleX(-1)}#status{font-size:18px;font-weight:700;color:#2d6866;min-height:52px}#progress{height:8px;background:#dceae3;border-radius:99px;overflow:hidden}#progress span{display:block;height:100%;width:0;background:#4d9f7e}textarea{width:100%;min-height:300px;border:1px solid #c9d9d1;border-radius:11px;padding:12px;font-size:13px;font-family:monospace}#results{display:none}a{color:#2d6866}
+</style></head><body><div class="wrap">
+<h1>ChewPlay — Kiểm tra nguyên nhân bỏ sót nhai kín</h1>
+<p>Trang này <b>chỉ đo tín hiệu</b>, không đổi app chính hay mẫu đã học. Camera xử lý ngay trên iPhone. Không ghi hoặc gửi ảnh/video. Chỉ khi bạn bấm Sao chép, báo cáo số đo mới được sao chép để bạn chủ động gửi.</p>
+<article><h2>Thực hiện một lần</h2>
+<p><b>0–2 giây:</b> giữ yên, không nhai. <b>2–12 giây:</b> nhai kín miệng bình thường khoảng 10 lần. <b>12–14 giây:</b> giữ yên trở lại. Đặt iPhone cố định và có đủ ánh sáng.</p>
+<button id="start">Bắt đầu kiểm tra nhai kín (14 giây)</button><p id="status" role="status">Chưa bắt đầu</p>
+<div id="progress"><span></span></div><p class="muted" id="loaded">Mẫu học cũ: đang kiểm tra…</p></article>
+<article><h2>Camera trước</h2><video id="camera" muted autoplay playsinline webkit-playsinline></video><p class="muted">Không cần mở YouTube hoặc học lại trước khi kiểm tra.</p></article>
+<article id="results"><h2>Kết quả đo trên iPhone</h2><p id="summary"></p><button id="copy">Sao chép báo cáo để gửi</button><p class="muted">Báo cáo chứa thông số chuyển động hàm đã rút gọn; không có ảnh, video, tên người hoặc đường link YouTube.</p><textarea id="report" readonly></textarea></article>
+</div><script type="module">
+const LANDMARKS = Object.freeze({
+  mouthTop: 13, mouthBottom: 14, upperLip: 0, lowerLip: 17,
+  mouthLeft: 61, mouthRight: 291, nose: 1, chin: 152,
+  eyeLeft: 33, eyeRight: 263,
+  cheekLeft: 93, cheekRight: 323, jawLeft: 172, jawRight: 397,
+});
+
+function distance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+function quantile(xs, p) {
+  if (!xs.length) return 0;
+  const a = [...xs].sort((x, y) => x - y);
+  const idx = (a.length - 1) * p;
+  const k = Math.floor(idx);
+  return a[k] + (a[Math.min(k + 1, a.length - 1)] - a[k]) * (idx - k);
+}
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function metricsFromFace(points) {
+  if (!Array.isArray(points) || points.length < 292) return null;
+  const l = LANDMARKS;
+  const get = id => points[id];
+  if (Object.values(l).some(id => !get(id) || !Number.isFinite(get(id).x) || !Number.isFinite(get(id).y))) return null;
+  const mouthW = Math.max(0.005, distance(get(l.mouthLeft), get(l.mouthRight)));
+  const eyeW = Math.max(0.005, distance(get(l.eyeLeft), get(l.eyeRight)));
+  return {
+    gap: distance(get(l.mouthTop), get(l.mouthBottom)) / mouthW,
+    lip: distance(get(l.upperLip), get(l.lowerLip)) / mouthW,
+    jaw: distance(get(l.nose), get(l.chin)) / eyeW,
+    headX: (get(l.eyeLeft).x + get(l.eyeRight).x) / 2,
+    headY: (get(l.eyeLeft).y + get(l.eyeRight).y) / 2,
+    headScale: eyeW,
+    // Jaw/cheek geometry works while the lips remain together; normalize by eye width.
+    cornerL: distance(get(l.mouthLeft), get(l.cheekLeft))/eyeW,
+    cornerR: distance(get(l.mouthRight), get(l.cheekRight))/eyeW,
+    lowerL: distance(get(l.mouthLeft), get(l.jawLeft))/eyeW,
+    lowerR: distance(get(l.mouthRight), get(l.jawRight))/eyeW,
+    jawSpan: distance(get(l.jawLeft), get(l.jawRight))/eyeW,
+    cheekSpan: distance(get(l.cheekLeft), get(l.cheekRight))/eyeW,
+    // Depth (Z) and eye-relative lower-face motion were informative in the earlier Flutter feature extraction.
+    // MediaPipe Z uses approximately the same normalized scale as X, so normalize by inter-eye distance.
+    chinZ: Number.isFinite(get(l.chin).z) && Number.isFinite(get(l.nose).z) ? (get(l.chin).z-get(l.nose).z)/eyeW : NaN,
+    lipZ: Number.isFinite(get(l.lowerLip).z) && Number.isFinite(get(l.upperLip).z) ? (get(l.lowerLip).z-get(l.upperLip).z)/eyeW : NaN,
+    leftJawZ: Number.isFinite(get(l.jawLeft).z) && Number.isFinite(get(l.cheekLeft).z) ? (get(l.jawLeft).z-get(l.cheekLeft).z)/eyeW : NaN,
+    rightJawZ: Number.isFinite(get(l.jawRight).z) && Number.isFinite(get(l.cheekRight).z) ? (get(l.jawRight).z-get(l.cheekRight).z)/eyeW : NaN,
+    leftCornerZ: Number.isFinite(get(l.mouthLeft).z) && Number.isFinite(get(l.nose).z) ? (get(l.mouthLeft).z-get(l.nose).z)/eyeW : NaN,
+    rightCornerZ: Number.isFinite(get(l.mouthRight).z) && Number.isFinite(get(l.nose).z) ? (get(l.mouthRight).z-get(l.nose).z)/eyeW : NaN,
+    chinY: (get(l.chin).y-get(l.nose).y)/eyeW,
+    leftJawY: (get(l.jawLeft).y-get(l.nose).y)/eyeW,
+    rightJawY: (get(l.jawRight).y-get(l.nose).y)/eyeW,
+  };
+}
+
+const $ = id => document.getElementById(id);
+const keys=['chinZ','lipZ','leftJawZ','rightJawZ','leftCornerZ','rightCornerZ','chinY','leftJawY','rightJawY','jaw','gap','lip','cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan'];
+const saved=(()=>{try{return JSON.parse(localStorage.getItem('chewplay-web-closed-personal-v1')||'null')}catch{return null}})();
+$('loaded').textContent=saved && saved.key ? 'Mẫu đã học đang lưu: '+saved.key+' · ngưỡng '+Number(saved.threshold).toFixed(5) : 'Không tìm thấy mẫu nhai kín đã lưu trên Safari này.';
+const start=$('start'),status=$('status'),camera=$('camera');
+let stream=null,landmarker=null,active=false,frames=[],faceMissing=0,inferenceFailed=0,lastInfer=0,firstFace=null;
+function stat(s){status.textContent=s;}
+function percentileAbs(xs,p){return quantile(xs.map(Math.abs),p);}
+function peaks(records,key,polarity,limit){
+  let baseline=null,lastT=null,smoothed=0,armed=true,prev=-Infinity,count=0,peak=0,threshold=limit;
+  for(const r of records){
+    const v=r[key];if(!Number.isFinite(v))continue;
+    if(baseline===null){baseline=v;lastT=r.t;continue}
+    const dt=clamp(r.t-lastT,25,180);lastT=r.t;
+    const signed=(v-baseline)*polarity;
+    baseline+=(1-Math.exp(-dt/850))*(v-baseline);
+    smoothed=smoothed*.26+signed*.74;
+    peak=Math.max(peak,smoothed);
+    if(smoothed<threshold*.20)armed=true;
+    if(armed&&smoothed>threshold && r.t-prev>=240){count++;armed=false;prev=r.t}
+  }
+  return {count,peak};
+}
+function summarize(){
+  const rest=frames.filter(x=>x.phase==='rest'),chew=frames.filter(x=>x.phase==='chew'),end=frames.filter(x=>x.phase==='post');
+  const rows=[];
+  for(const key of keys){
+    const a=rest.map(x=>x[key]).filter(Number.isFinite),b=chew.map(x=>x[key]).filter(Number.isFinite);
+    if(a.length<4||b.length<12)continue;
+    const center=quantile(a,.5);
+    const noise=quantile(a.map(v=>Math.abs(v-center)),.95);
+    const range=quantile(b,.9)-quantile(b,.1);
+    const delta=Math.max(Math.abs(quantile(b,.9)-center),Math.abs(quantile(b,.1)-center));
+    const threshold=saved?.key===key&&Number.isFinite(saved.threshold)?saved.threshold:Math.max(.00025,noise*1.35,range*.23);
+    const positive=peaks(chew,key,1,threshold),negative=peaks(chew,key,-1,threshold);
+    const chosen=positive.count>=negative.count?positive:negative;
+    const restPeaks=peaks(rest,key,positive.count>=negative.count?1:-1,threshold).count;
+    rows.push({key,noise,range,delta,threshold,cycles:chosen.count,restPeaks,peak:chosen.peak,polarity:positive.count>=negative.count?1:-1});
+  }
+  rows.sort((a,b)=>(b.cycles-b.restPeaks)-(a.cycles-a.restPeaks)||b.range/Math.max(b.noise,.00001)-a.range/Math.max(a.noise,.00001));
+  let moved=0,prior=null;const valid=frames;
+  for(const r of valid){
+    if(prior && (Math.hypot(r.headX-prior.headX,r.headY-prior.headY)>.020 || Math.abs(r.headScale-prior.headScale)/Math.max(r.headScale,.01)>.028))moved++;
+    prior=r;
+  }
+  const times=frames.map(x=>x.t),duration=times.length>1?(times.at(-1)-times[0])/1000:0;
+  const profileRow=rows.find(x=>x.key===saved?.key);
+  const report=[
+    'CHEWPLAY IPHONE CLOSED CHEW DIAGNOSTIC V0.1',
+    'App: GitHub Pages /chewplay-web/ | No image or video stored/sent',
+    'Samples: rest='+rest.length+', chew='+chew.length+', post='+end.length+
+      ', missingFace='+faceMissing+', inferenceErrors='+inferenceFailed,
+    'EffectiveFPS='+(duration>0?(frames.length/duration).toFixed(1):'0')+
+      ', headShiftFrames='+moved,
+    'StoredProfile='+(saved?.key||'none')+
+      ', polarity='+(saved?.polarity??'n/a')+
+      ', threshold='+(Number.isFinite(saved?.threshold)?Number(saved.threshold).toFixed(6):'n/a'),
+    profileRow ? 'StoredProfileMeasured: cycles='+profileRow.cycles+', noise='+profileRow.noise.toFixed(6)+
+      ', movementRange='+profileRow.range.toFixed(6)+', peak='+profileRow.peak.toFixed(6)+
+      ', measuredThreshold='+profileRow.threshold.toFixed(6) : 'StoredProfileMeasured: unavailable',
+    'TopSignals (observed cycles / still false peaks / range / noise / threshold / polarity):',
+    ...rows.slice(0,12).map(x=>x.key+': '+x.cycles+' / '+x.restPeaks+' / '+x.range.toFixed(6)+
+      ' / '+x.noise.toFixed(6)+' / '+x.threshold.toFixed(6)+' / '+x.polarity),
+    'NOTE: observed cycles are diagnostic estimates, NOT validated chewing counts.'
+  ].join('\n');
+  $('report').value=report;
+  $('summary').textContent='Đã thu '+rest.length+' khung hình đứng yên và '+chew.length+' khung hình nhai. '+(profileRow?'Tín hiệu mẫu cũ: '+profileRow.key+', số chu kỳ ước lượng '+profileRow.cycles+'.':'Không đọc được tín hiệu mẫu cũ.');
+  $('results').style.display='block';
+  $('results').scrollIntoView({behavior:'smooth',block:'start'});
+  if(stream)for(const track of stream.getTracks())track.stop();
+  camera.srcObject=null;stream=null;landmarker?.close?.();landmarker=null;
+  active=false;start.disabled=false;
+}
+async function begin(){
+  if(active)return;active=true;start.disabled=true;frames=[];faceMissing=0;inferenceFailed=0;firstFace=null;lastInfer=0;stat('Đang chuẩn bị camera và MediaPipe…');
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:20}},audio:false});
+    camera.srcObject=stream;await camera.play();
+    const vision=await import(new URL('./assets/mediapipe/vision_bundle.mjs',document.baseURI).href);
+    const fileset=await vision.FilesetResolver.forVisionTasks(new URL('./assets/mediapipe/wasm',document.baseURI).href);
+    let err;
+    for(const delegate of ['GPU','CPU']){try{
+      landmarker=await vision.FaceLandmarker.createFromOptions(fileset,{baseOptions:{modelAssetPath:new URL('./assets/mediapipe/model/face_landmarker.task',document.baseURI).href,delegate},runningMode:'VIDEO',numFaces:1});
+      break;
+    }catch(e){err=e}}
+    if(!landmarker)throw err||new Error('Không tạo được FaceLandmarker');
+    stat('Đưa mặt vào khung camera…');requestAnimationFrame(frame);
+  }catch(e){stat('Lỗi camera hoặc AI: '+(e?.message||e?.name||'không rõ'));active=false;start.disabled=false;
+    if(stream)for(const track of stream.getTracks())track.stop();stream=null;
+  }
+}
+function frame(now){
+  if(!active)return;
+  if(camera.readyState>=2 && now-lastInfer>=60){
+    lastInfer=now;
+    try{
+      const face=landmarker.detectForVideo(camera,now).faceLandmarks?.[0];
+      const m=face?metricsFromFace(face):null;
+      if(m){
+        if(firstFace===null)firstFace=now;
+        const elapsed=now-firstFace;
+        const phase=elapsed<2000?'rest':elapsed<12000?'chew':'post';
+        frames.push({t:now,phase,...m});
+        const rem=phase==='rest'?Math.ceil((2000-elapsed)/1000):phase==='chew'?Math.ceil((12000-elapsed)/1000):Math.ceil((14000-elapsed)/1000);
+        stat(phase==='rest'?'GIỮ YÊN — '+rem+' giây':phase==='chew'?'NHAI KÍN MIỆNG — '+rem+' giây':'NGỪNG NHAI — '+rem+' giây');
+        $('progress').firstElementChild.style.width=Math.min(100,Math.round(100*elapsed/14000))+'%';
+        if(elapsed>=14000){stat('Đã đo xong, chỉ lưu số đo tại trang này.');summarize();return}
+      }else{faceMissing++;stat('Đưa khuôn mặt vào giữa camera để bắt đầu…')}
+    }catch(e){inferenceFailed++;stat('Lỗi phân tích: '+(e?.message||e?.name||'không rõ'))}
+  }
+  requestAnimationFrame(frame);
+}
+start.addEventListener('click',begin);
+$('copy').addEventListener('click',async()=>{
+  const t=$('report');try{await navigator.clipboard.writeText(t.value);$('copy').textContent='Đã sao chép báo cáo'}
+  catch{t.focus();t.select();document.execCommand('copy');$('copy').textContent='Đã chọn báo cáo — có thể Sao chép'}
+});
+</script></body></html>
