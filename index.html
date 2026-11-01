@@ -169,8 +169,8 @@ class ChewDetector {
 
 const $ = id => document.getElementById(id);
 const configKey = 'chewplay-web-v01-settings';
-const modelURL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-const wasmRoot = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm';
+const modelURL = new URL('./assets/mediapipe/model/face_landmarker.task', document.baseURI).href;
+const wasmRoot = new URL('./assets/mediapipe/wasm', document.baseURI).href;
 const saved = (()=>{ try{return JSON.parse(localStorage.getItem(configKey) || '{}');}catch{return {};} })();
 const detector = new ChewDetector();
 const state = {
@@ -326,10 +326,9 @@ function readableCameraError(err){
   return ((err?.name || 'Error') + ': ' + (err?.message || 'Không có thông tin chi tiết')).slice(0,200);
 }
 async function loadFaceLandmarker(report){
-  // Use MediaPipe's officially published ESM bundle, not the CDN-generated +esm transform.
+  // Same-origin ESM/WASM/model: Safari does not need cross-origin CDN module imports.
   const providers=[
-    {name:'jsDelivr',module:'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs',wasm:wasmRoot},
-    {name:'unpkg',module:'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs',wasm:'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/wasm'}
+    {name:'ChewPlay',module:new URL('./assets/mediapipe/vision_bundle.mjs', document.baseURI).href,wasm:wasmRoot}
   ];
   const failures=[];
   for(const provider of providers){
