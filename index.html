@@ -55,6 +55,8 @@ body.chew-theater{background:#f4f8f6}body.chew-theater .app{max-width:none}body.
         <div class="tracker-info"><div class="number" id="chewCount" aria-live="polite">0</div><div class="number-label">lần nhai phát hiện</div><div class="status" id="trackingStatus">Chưa bắt đầu</div><div class="meter"><span id="chewMeter"></span></div></div>
       </div>
       <div class="actions"><button class="primary" id="startCamera" type="button">Bắt đầu nhận diện</button><button class="secondary" id="stopCamera" type="button" disabled>Dừng camera</button></div>
+      <button class="secondary" id="trainClosed" type="button" disabled style="width:100%;margin-top:10px">Học nhai kín miệng (10 giây)</button>
+      <p class="mini" id="trainClosedInfo">Cần học một lần theo chuyển động hàm thực tế để phát hiện nhai kín miệng tốt hơn. Không lưu hình ảnh hay video.</p>
       <p class="mini" id="privacyNote">Camera chỉ xử lý trên thiết bị. Không ghi hình, không gửi hoặc lưu ảnh khuôn mặt.</p>
     </section>
 
@@ -65,7 +67,7 @@ body.chew-theater{background:#f4f8f6}body.chew-theater .app{max-width:none}body.
     </section>
 
     <div class="info"><strong>Cách sử dụng:</strong> Chọn video → nhấn nút phát trong YouTube (hoặc video máy) → bật camera → giữ mặt yên 3 giây để hiệu chỉnh → nhai thử. Nếu video không tự phát lại trên iPhone, hãy nhấn Play trong trình phát.</div>
-    <details class="technical"><summary>Thông tin kiểm thử & giới hạn</summary><p>Nhận diện web hiện dùng MediaPipe Face Landmarker và ngưỡng hiệu chỉnh mới, KHÔNG phải mô hình KNN đã kiểm thử trên Flutter. Cần kiểm thử lại với trẻ trên thiết bị thật. Nói chuyện, biểu cảm và di chuyển đầu có thể gây nhận diện nhầm. Việc tự phát lại YouTube có thể bị iOS/Safari chặn do chính sách phát video; ứng dụng không thể vượt qua hạn chế trình duyệt.</p><p>Yêu cầu HTTPS, camera trước và Internet để dùng YouTube hoặc tải mô hình nhận diện lần đầu. Không có dữ liệu trẻ em được tải lên máy chủ ChewPlay. Khi dùng YouTube, chính sách dữ liệu riêng của YouTube vẫn áp dụng.</p></details>
+    <details class="technical"><summary>Thông tin kiểm thử & giới hạn</summary><p>Nhận diện web hiện dùng MediaPipe Face Landmarker và hiệu chỉnh riêng từ chuyển động nhai thực tế, KHÔNG phải mô hình KNN đã kiểm thử trên Flutter. Cần kiểm thử lại với trẻ trên thiết bị thật. Nói chuyện, biểu cảm và di chuyển đầu có thể gây nhận diện nhầm. Việc tự phát lại YouTube có thể bị iOS/Safari chặn do chính sách phát video; ứng dụng không thể vượt qua hạn chế trình duyệt.</p><p>Yêu cầu HTTPS, camera trước và Internet để dùng YouTube hoặc tải mô hình nhận diện lần đầu. Không có dữ liệu trẻ em được tải lên máy chủ ChewPlay. Khi dùng YouTube, chính sách dữ liệu riêng của YouTube vẫn áp dụng.</p></details>
   </main>
   <footer>ChewPlay • Bản thử nghiệm Web V0.1 • Không thay thế việc quan sát trẻ khi ăn</footer>
 </div>
@@ -112,6 +114,17 @@ function metricsFromFace(points) {
     lowerR: distance(get(l.mouthRight), get(l.jawRight))/eyeW,
     jawSpan: distance(get(l.jawLeft), get(l.jawRight))/eyeW,
     cheekSpan: distance(get(l.cheekLeft), get(l.cheekRight))/eyeW,
+    // Depth (Z) and eye-relative lower-face motion were informative in the earlier Flutter feature extraction.
+    // MediaPipe Z uses approximately the same normalized scale as X, so normalize by inter-eye distance.
+    chinZ: Number.isFinite(get(l.chin).z) && Number.isFinite(get(l.nose).z) ? (get(l.chin).z-get(l.nose).z)/eyeW : NaN,
+    lipZ: Number.isFinite(get(l.lowerLip).z) && Number.isFinite(get(l.upperLip).z) ? (get(l.lowerLip).z-get(l.upperLip).z)/eyeW : NaN,
+    leftJawZ: Number.isFinite(get(l.jawLeft).z) && Number.isFinite(get(l.cheekLeft).z) ? (get(l.jawLeft).z-get(l.cheekLeft).z)/eyeW : NaN,
+    rightJawZ: Number.isFinite(get(l.jawRight).z) && Number.isFinite(get(l.cheekRight).z) ? (get(l.jawRight).z-get(l.cheekRight).z)/eyeW : NaN,
+    leftCornerZ: Number.isFinite(get(l.mouthLeft).z) && Number.isFinite(get(l.nose).z) ? (get(l.mouthLeft).z-get(l.nose).z)/eyeW : NaN,
+    rightCornerZ: Number.isFinite(get(l.mouthRight).z) && Number.isFinite(get(l.nose).z) ? (get(l.mouthRight).z-get(l.nose).z)/eyeW : NaN,
+    chinY: (get(l.chin).y-get(l.nose).y)/eyeW,
+    leftJawY: (get(l.jawLeft).y-get(l.nose).y)/eyeW,
+    rightJawY: (get(l.jawRight).y-get(l.nose).y)/eyeW,
   };
 }
 
@@ -124,10 +137,14 @@ class ChewDetector {
     this.closedThreshold=.003; this.closedSmoothed=0; this.closedHits=0; this.closedAbove=false;
     this.closedBaseline=null; this.closedPolarity=0; this.lastMetrics=null; this.lastFaceMs=-Infinity;
     this.motionGuardUntil=-Infinity;
+    // A person-specific profile is retained across reset; the camera image is never persisted.
+    this.personalBaseline=null;this.personalSmoothed=0;this.personalArmed=true;
+    this.personalLastTime=null;
   }
   setSensitivity(value) { this.sensitivity=clamp(Number(value)||1,.6,1.6); }
   update(m, nowMs) {
-    if (!m || Object.values(m).some(v => !Number.isFinite(v))) {
+    // Not every phone exports usable Z. Do not discard an otherwise valid 2D face.
+    if (!m || ['gap','lip','jaw','headX','headY','headScale','cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan'].some(key=>!Number.isFinite(m[key]))) {
       // Missing landmarks are not chewing. Keep the user's counted chews.
       if(nowMs-this.lastFaceMs>950 && this.ready){
         this.previous=null;this.above=false;this.closedAbove=false;this.closedHits=0;
@@ -170,6 +187,7 @@ class ChewDetector {
       // Drop geometry from the old pose, rather than treating a turned head as jaw motion.
       for(const key of ChewDetector.CLOSED_CHANNELS)this.closedBaseline[key]=m[key];
       this.closedSmoothed=0; this.closedHits=0; this.closedAbove=false; this.closedPolarity=0;
+      this.personalBaseline=null;this.personalArmed=true;
     }
     const raw=this.movement(m);
     this.smoothed=this.smoothed*.36+raw*.64;
@@ -194,21 +212,75 @@ class ChewDetector {
     else this.closedHits=0;
     const closedExceeded=stable && this.closedHits>=2 && Math.abs(this.closedSmoothed)>closedLimit &&
       (this.closedPolarity===0 || Math.sign(this.closedSmoothed)===this.closedPolarity || nowMs-this.lastChewMs>1500);
+    // Compare against a real labeled closed-chewing sample, if the user trained one.
+    const personal=this.personalClosedSignal(m,nowMs,!headShift);
     let chewed=false,kind=null;
     if(!stable){
       this.above=openExceeded;
-    }else if(!this.above && !this.closedAbove && (openExceeded || closedExceeded) && nowMs-this.lastChewMs>=280){
+    }else if(!this.above && !this.closedAbove && (openExceeded || (this.profile ? personal.detected : closedExceeded)) && nowMs-this.lastChewMs>=240){
       this.chews++; this.lastChewMs=nowMs;
       this.above=openExceeded; this.closedAbove=closedExceeded;
       chewed=true; kind=openExceeded?'open':'closed';
       if(kind==='closed')this.closedPolarity=Math.sign(this.closedSmoothed)||1;
     }else{
       if(this.above && this.smoothed<openLimit*.62)this.above=false;
-      if(this.closedAbove && this.closedSmoothed*this.closedPolarity<closedLimit*.15)this.closedAbove=false;
+      if(this.closedAbove && (this.profile ? personal.rearmed : this.closedSmoothed*this.closedPolarity<closedLimit*.15))this.closedAbove=false;
     }
     return {face:true,ready:true,calibrating:false,chewed,count:this.chews,kind,
-      score:Math.max(this.smoothed/openLimit,this.closedSmoothed/closedLimit),
+      score:Math.max(this.smoothed/openLimit,this.closedSmoothed/closedLimit,personal.signal||0),
       threshold:1,headShift:!stable};
+  }
+  // Personal learning takes separate labeled samples: 2 seconds still, then 7 seconds chewing closed.
+  // Select the channel with best movement-to-rest noise separation, never a guessed universal threshold.
+  learnClosedProfile(still,chewing){
+    if(still.length<8 || chewing.length<20)return {ok:false,reason:'Chưa đủ khung hình để học.'};
+    const choices=[];
+    for(const key of ChewDetector.PERSONAL_CHANNELS){
+      const a=still.map(m=>m[key]).filter(Number.isFinite);
+      const b=chewing.map(m=>m[key]).filter(Number.isFinite);
+      if(a.length<8 || b.length<20)continue;
+      const center=quantile(a,.5);
+      const noise=quantile(a.map(v=>Math.abs(v-center)),.95);
+      const upper=quantile(b,.9)-center;
+      const lower=center-quantile(b,.1);
+      const amplitude=Math.max(upper,lower);
+      // Exclude dimensions where apparent movement is indistinguishable from jitter.
+      if(amplitude<Math.max(.00025,noise*1.65))continue;
+      const polarity=upper>=lower?1:-1;
+      const separation=amplitude/Math.max(noise,.00015);
+      const range=quantile(b,.9)-quantile(b,.1);
+      choices.push({key,polarity,amplitude,noise,separation,range,center});
+    }
+    choices.sort((a,b)=>b.separation-a.separation || b.range-a.range);
+    if(!choices.length)return {ok:false,reason:'Không tìm thấy chuyển động hàm khác biệt rõ với khi giữ yên. Hãy thử đủ ánh sáng, giữ iPhone cố định, nhai kín miệng rõ ràng.'};
+    const best=choices[0];
+    const profile={key:best.key,polarity:best.polarity,threshold:Math.max(best.noise*1.35,best.amplitude*.23,.00022),amplitude:best.amplitude,noise:best.noise,version:1};
+    this.setProfile(profile);
+    return {ok:true,profile,rank:choices.slice(0,3)};
+  }
+  setProfile(p){
+    if(!p || !ChewDetector.PERSONAL_CHANNELS.includes(p.key) || ![-1,1].includes(p.polarity) || !Number.isFinite(p.threshold) || p.threshold<=0)return false;
+    this.profile={key:p.key,polarity:p.polarity,threshold:clamp(p.threshold,.0001,.30),version:1};
+    this.personalBaseline=null;this.personalSmoothed=0;this.personalArmed=true;this.personalLastTime=null;
+    return true;
+  }
+  personalClosedSignal(m,nowMs,stable){
+    const profile=this.profile;
+    if(!profile || !Number.isFinite(m[profile.key]) || !stable)return {detected:false,rearmed:false};
+    const value=m[profile.key];
+    if(this.personalBaseline===null){this.personalBaseline=value;this.personalLastTime=nowMs;return {detected:false,rearmed:false};}
+    const dt=clamp(nowMs-(this.personalLastTime??nowMs-65),25,180);
+    this.personalLastTime=nowMs;
+    // Remove slow head-position drift without attenuating the normal 0.7-2 Hz chewing rhythm.
+    const signed=(value-this.personalBaseline)*profile.polarity;
+    this.personalBaseline+=(1-Math.exp(-dt/850))*(value-this.personalBaseline);
+    this.personalSmoothed=this.personalSmoothed*.26+signed*.74;
+    const threshold=profile.threshold/this.sensitivity;
+    if(this.personalSmoothed<threshold*.20)this.personalArmed=true;
+    if(this.personalArmed && this.personalSmoothed>threshold){
+      this.personalArmed=false;return {detected:true,rearmed:false,signal:Math.abs(this.personalSmoothed)/threshold};
+    }
+    return {detected:false,rearmed:this.personalArmed,signal:Math.abs(this.personalSmoothed)/threshold};
   }
   closedDeviation(m,base){
     if(!base)return 0;
@@ -235,19 +307,23 @@ class ChewDetector {
   }
 }
 ChewDetector.CLOSED_CHANNELS=Object.freeze(['cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan']);
+ChewDetector.PERSONAL_CHANNELS=Object.freeze(['chinZ','lipZ','leftJawZ','rightJawZ','leftCornerZ','rightCornerZ','chinY','leftJawY','rightJawY','jaw','gap','lip','cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan']);
 
 
 const $ = id => document.getElementById(id);
 const configKey = 'chewplay-web-v01-settings';
+const closedProfileKey = 'chewplay-web-closed-personal-v1';
 const modelURL = new URL('./assets/mediapipe/model/face_landmarker.task', document.baseURI).href;
 const wasmRoot = new URL('./assets/mediapipe/wasm', document.baseURI).href;
 const saved = (()=>{ try{return JSON.parse(localStorage.getItem(configKey) || '{}');}catch{return {};} })();
 const detector = new ChewDetector();
+try{const savedClosedProfile=JSON.parse(localStorage.getItem(closedProfileKey)||'null');if(savedClosedProfile)detector.setProfile(savedClosedProfile);}catch{}
 const state = {
   source: 'youtube', yt: null, ytReady: false, ytId: '', ytApiReady: false,
   mediaURL: null, cameraStream: null, landmarker: null, detecting: false,
   trackerSession: 0, lastInferenceMs: 0, tracking: false, lastChewMs: null,
   playedOnce: false, pausedByChew: false, modelLoading: false, videoWasPlaying: false,
+  closedTraining:null,
   resumePending: false, blockedPlayback: false, manualPaused: false, resumeRequestMs: 0, lastDetectedChewMs: -Infinity,
 };
 function note(s) { $('playerNote').textContent = s; }
@@ -449,7 +525,8 @@ async function startTracking(){
     state.lastChewMs=null;state.tracking=true;state.trackerSession++;
     state.lastInferenceMs=0;state.modelLoading=false;
     $('cameraBadge').textContent='Đang hoạt động';$('cameraBadge').classList.add('active');
-    $('stopCamera').disabled=false;
+    $('stopCamera').disabled=false;$('trainClosed').disabled=false;
+    $('trainClosedInfo').textContent=detector.profile?'Đã có mẫu nhai kín được học trên thiết bị. Có thể bấm để học lại.':'Camera sẵn sàng. Bấm Học nhai kín miệng để ghi nhận chuyển động hàm thực tế (không lưu hình).';
     trackerStatus('Nhìn vào camera và giữ yên 3 giây…');
     detectLoop(state.trackerSession);
   } catch(err){
@@ -464,7 +541,7 @@ async function startTracking(){
   } finally {state.modelLoading=false;if(!state.tracking)$('startCamera').disabled=false;}
 }
 function stopTracking(){
-  state.tracking=false;state.trackerSession++;
+  state.tracking=false;state.trackerSession++;state.closedTraining=null;$('trainClosed').disabled=true;
   for(const track of state.cameraStream?.getTracks()||[])track.stop();
   state.cameraStream=null;
   const preview=$('cameraPreview');preview.pause();preview.srcObject=null;
@@ -482,14 +559,35 @@ function detectLoop(session){
     try{
       const result=state.landmarker.detectForVideo(camera,now);
       const face=result.faceLandmarks?.[0];
-      const info=detector.update(face?metricsFromFace(face):null,now);
+      const measures=face?metricsFromFace(face):null;
+      if(state.closedTraining){
+        const t=state.closedTraining,elapsed=now-t.start;
+        if(measures){
+          if(elapsed<2300)t.still.push(measures);
+          else if(elapsed<9600)t.chewing.push(measures);
+        }
+        const remaining=Math.max(0,Math.ceil((9600-elapsed)/1000));
+        if(elapsed<2300)trackerStatus('Học nhai kín: giữ yên mặt '+remaining+' giây');
+        else trackerStatus('Học nhai kín: nhai kín miệng liên tục '+remaining+' giây');
+        if(elapsed>=9600){
+          state.closedTraining=null;$('trainClosed').disabled=false;$('trainClosed').textContent='Học lại nhai kín (10 giây)';
+          const result=detector.learnClosedProfile(t.still,t.chewing);
+          if(result.ok){
+            try{localStorage.setItem(closedProfileKey,JSON.stringify(result.profile));}catch{}
+            $('trainClosedInfo').textContent='Đã học chuyển động nhai kín từ tín hiệu '+result.profile.key+' trên thiết bị này; không lưu ảnh. Hãy nhai thử để kiểm tra.';
+            trackerStatus('Đã học nhai kín. Thử nhai và xem bộ đếm.');
+          }else{trackerStatus('Chưa học được: '+result.reason);$('trainClosedInfo').textContent=result.reason;}
+        }
+      }else{
+        const info=detector.update(measures,now);
       if(!info.face){trackerStatus('Chưa thấy khuôn mặt – đưa mặt vào khung camera');$('chewMeter').style.width='0';}
       else if(info.calibrating){trackerStatus('Hiệu chỉnh: giữ yên '+Math.round(info.calibrationProgress*100)+'%');$('chewMeter').style.width= Math.round(info.calibrationProgress*100)+'%';}
       else{
         if(state.lastChewMs===null && state.playedOnce)state.lastChewMs=now;
-        trackerStatus(info.chewed?(info.kind==='closed'?'Đã nhận diện nhai kín miệng':'Đã nhận diện một lần nhai'):'Đang theo dõi chuyển động nhai');
+        trackerStatus(info.chewed?(info.kind==='closed'?'Đã nhận diện nhai kín miệng':'Đã nhận diện một lần nhai'):(detector.profile?'Đang theo dõi nhai kín theo mẫu đã học':'Đang theo dõi chuyển động nhai — có thể bấm Học nhai kín'));
         $('chewMeter').style.width=Math.min(100,Math.max(0,(info.score||0)/Math.max(info.threshold,.001)*55))+'%';
         if(info.chewed)onChew(now);
+      }
       }
     }catch(e){trackerStatus('Lỗi Face Mesh: '+(e?.message||'không rõ'));}
   }
@@ -510,6 +608,13 @@ $('localPlayer').addEventListener('play',()=>{if(state.source==='local'){state.p
 $('localPlayer').addEventListener('pause',()=>{if(state.source==='local'&&!state.pausedByChew && !state.resumePending){state.playedOnce=false;state.manualPaused=true;}});
 $('localPlayer').addEventListener('ended',()=>{state.playedOnce=false;state.pausedByChew=false;});
 $('startCamera').addEventListener('click',startTracking);$('stopCamera').addEventListener('click',stopTracking);
+$('trainClosed').addEventListener('click',()=>{
+  if(!state.tracking || state.closedTraining)return;
+  state.closedTraining={start:performance.now(),still:[],chewing:[]};
+  $('trainClosed').disabled=true;
+  $('trainClosedInfo').textContent='Giai đoạn 1: giữ mặt yên 2 giây. Sau đó nhai kín miệng bình thường trong 7 giây. Không cần há to.';
+  trackerStatus('Bắt đầu học: giữ mặt yên 2 giây.');
+});
 $('unlockPlayback').addEventListener('click',()=>{
   // Explicit iPhone user gesture; cannot override the browser's own autoplay decision.
   hideUnlock();
