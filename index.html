@@ -321,27 +321,60 @@ function onChew(now){
     resumeMedia();
   }
 }
+// Safari diagnostics: keep each failure stage visible instead of hiding every error as "TypeError".
+function readableCameraError(err){
+  return ((err?.name || 'Error') + ': ' + (err?.message || 'Không có thông tin chi tiết')).slice(0,200);
+}
+async function loadFaceLandmarker(report){
+  // Use MediaPipe's officially published ESM bundle, not the CDN-generated +esm transform.
+  const providers=[
+    {name:'jsDelivr',module:'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs',wasm:wasmRoot},
+    {name:'unpkg',module:'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs',wasm:'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/wasm'}
+  ];
+  const failures=[];
+  for(const provider of providers){
+    try{
+      report('Tải thư viện AI từ '+provider.name);
+      const vision=await import(provider.module);
+      if(!vision.FaceLandmarker || !vision.FilesetResolver)throw new TypeError('Không tìm thấy FaceLandmarker hoặc FilesetResolver');
+      report('Khởi tạo bộ xử lý AI từ '+provider.name);
+      const fileset=await vision.FilesetResolver.forVisionTasks(provider.wasm);
+      for(const delegate of ['GPU','CPU']){
+        try{
+          report('Khởi tạo mô hình AI '+delegate+' ('+provider.name+')');
+          return await vision.FaceLandmarker.createFromOptions(fileset,{
+            baseOptions:{modelAssetPath:modelURL,delegate},runningMode:'VIDEO',numFaces:1
+          });
+        }catch(e){failures.push(provider.name+' '+delegate+': '+readableCameraError(e));}
+      }
+    }catch(e){failures.push(provider.name+': '+readableCameraError(e));}
+  }
+  throw new Error('Không tải được MediaPipe. '+failures.join(' | ').slice(0,350));
+}
 async function startTracking(){
   if(state.tracking || state.modelLoading)return;
-  if(!navigator.mediaDevices?.getUserMedia){trackerStatus('Trình duyệt cần HTTPS và hỗ trợ camera.');return;}
+  if(!navigator.mediaDevices?.getUserMedia){trackerStatus('Trình duyệt không hỗ trợ camera. Mở ứng dụng bằng Safari qua HTTPS.');return;}
   state.modelLoading=true;
   $('startCamera').disabled=true;
-  trackerStatus('Đang xin quyền camera…');
+  let stage='Xin quyền camera';
+  const report=message=>{stage=message;trackerStatus(message+'…');};
+  report(stage);
   try{
-    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:20,max:30}},audio:false});
-    state.cameraStream=stream;
-    const preview=$('cameraPreview');preview.srcObject=stream;
-    await preview.play(); $('cameraBlank').classList.add('hidden');
-    trackerStatus('Đang tải mô hình AI… (lần đầu cần Internet)');
-    if(!state.landmarker){
-      const {FaceLandmarker,FilesetResolver}=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');
-      const fileset=await FilesetResolver.forVisionTasks(wasmRoot);
-      try {
-        state.landmarker=await FaceLandmarker.createFromOptions(fileset,{baseOptions:{modelAssetPath:modelURL,delegate:'GPU'},runningMode:'VIDEO',numFaces:1});
-      } catch{
-        state.landmarker=await FaceLandmarker.createFromOptions(fileset,{baseOptions:{modelAssetPath:modelURL,delegate:'CPU'},runningMode:'VIDEO',numFaces:1});
-      }
+    let stream;
+    try{
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:20,max:30}},audio:false});
+    }catch(e){
+      // Some Safari camera implementations reject ideal constraints. Retry only that case.
+      if(!['TypeError','OverconstrainedError'].includes(e?.name))throw e;
+      report('Thử lại camera với cấu hình đơn giản');
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
     }
+    state.cameraStream=stream;
+    const preview=$('cameraPreview');
+    preview.muted=true;preview.setAttribute('playsinline','');preview.srcObject=stream;
+    report('Hiển thị camera trước');
+    await preview.play();$('cameraBlank').classList.add('hidden');
+    if(!state.landmarker){state.landmarker=await loadFaceLandmarker(report);}
     detector.reset();detector.setSensitivity($('sensitivity').value);
     $('chewCount').textContent='0';$('chewMeter').style.width='0';
     state.lastChewMs=null;state.tracking=true;state.trackerSession++;
@@ -352,8 +385,13 @@ async function startTracking(){
     detectLoop(state.trackerSession);
   } catch(err){
     stopTracking();
-    const code=err?.name || 'unknown';
-    trackerStatus(code==='NotAllowedError'?'Bạn chưa cấp quyền camera cho ứng dụng.':'Không thể bắt đầu: '+code+'. Kiểm tra HTTPS, camera và kết nối.');
+    const code=err?.name || 'Error';
+    if(code==='NotAllowedError'||code==='PermissionDeniedError'){
+      trackerStatus('Chưa được cấp quyền camera. Vào Safari > aA > Cài đặt trang web > Camera > Cho phép, sau đó thử lại.');
+    }else{
+      trackerStatus('Lỗi ở bước ['+stage+']: '+readableCameraError(err)+'. Hãy chụp đúng dòng này để xác định nguyên nhân.');
+    }
+    playbackStatus('Camera chưa sẵn sàng: '+stage+'. Video không thể được điều khiển bằng nhai.');
   } finally {state.modelLoading=false;if(!state.tracking)$('startCamera').disabled=false;}
 }
 function stopTracking(){
