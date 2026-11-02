@@ -54,7 +54,17 @@ body.chew-theater{background:#f4f8f6}body.chew-theater .app{max-width:none}body.
         <div class="camera-shell"><video id="cameraPreview" autoplay muted playsinline webkit-playsinline></video><div id="cameraBlank" class="camera-blank"><div class="face-circle" aria-hidden="true">◡</div><span>Camera trước</span></div></div>
         <div class="tracker-info"><div class="number" id="chewCount" aria-live="polite">0</div><div class="number-label">lần nhai phát hiện</div><div class="status" id="trackingStatus">Chưa bắt đầu</div><div class="meter"><span id="chewMeter"></span></div></div>
       </div>
-      <div class="actions"><button class="primary" id="startCamera" type="button">Bắt đầu nhận diện</button><button class="secondary" id="stopCamera" type="button" disabled>Dừng camera</button></div>
+      <div class="source-line" style="margin:12px 0 4px">
+  <label for="chewerSelect">Người đang nhai — chọn trước khi đưa camera cho bé</label>
+  <select id="chewerSelect" style="width:100%;min-height:46px;border:1px solid #cbded6;border-radius:12px;background:#f4faf7;color:#235758;padding:10px;font:inherit;font-weight:700">
+    <option value="adult">Tôi (phụ huynh)</option>
+    <option value="child1">Bé 1</option>
+    <option value="child2">Bé 2</option>
+    <option value="child3">Bé 3</option>
+  </select>
+  <p class="mini" id="chewerInfo" role="status">Mỗi người có mẫu nhai riêng. Khi đổi người phải hiệu chỉnh lại 3 giây.</p>
+</div>
+<div class="actions"><button class="primary" id="startCamera" type="button">Bắt đầu nhận diện</button><button class="secondary" id="stopCamera" type="button" disabled>Dừng camera</button></div>
       <button class="secondary" id="trainClosed" type="button" disabled style="width:100%;margin-top:10px">Học nhai kín miệng (10 giây)</button>
       <p class="mini" id="trainClosedInfo">Cần học một lần theo chuyển động hàm thực tế để phát hiện nhai kín miệng tốt hơn. Không lưu hình ảnh hay video.</p>
       <p class="mini" id="privacyNote">Camera chỉ xử lý trên thiết bị. Không ghi hình, không gửi hoặc lưu ảnh khuôn mặt.</p>
@@ -365,6 +375,14 @@ ChewDetector.PERSONAL_CHANNELS=Object.freeze(['chinZ','lipZ','leftJawZ','rightJa
 const $ = id => document.getElementById(id);
 const configKey = 'chewplay-web-v01-settings';
 const closedProfileKey = 'chewplay-web-closed-personal-v1';
+const chewerChoiceKey = 'chewplay-web-active-chewer-v1';
+const chewerProfileKeys = Object.freeze({
+  adult:closedProfileKey,child1:'chewplay-web-closed-child1-v1',
+  child2:'chewplay-web-closed-child2-v1',child3:'chewplay-web-closed-child3-v1'
+});
+function storedChewerChoice(){try{const v=localStorage.getItem(chewerChoiceKey);return chewerProfileKeys[v]?v:'adult';}catch{return 'adult';}}
+function profileForChewer(v){try{return JSON.parse(localStorage.getItem(chewerProfileKeys[v])||'null');}catch{return null;}}
+function chewerName(v){return v==='adult'?'Tôi':'Bé '+v.slice(-1);}
 const modelURL = new URL('./assets/mediapipe/model/face_landmarker.task', document.baseURI).href;
 const wasmRoot = new URL('./assets/mediapipe/wasm', document.baseURI).href;
 const saved = (()=>{ try{return JSON.parse(localStorage.getItem(configKey) || '{}');}catch{return {};} })();
@@ -388,7 +406,7 @@ const state = {
   mediaURL: null, cameraStream: null, landmarker: null, detecting: false,
   trackerSession: 0, lastInferenceMs: 0, tracking: false, lastChewMs: null,
   playedOnce: false, pausedByChew: false, modelLoading: false, videoWasPlaying: false,
-  closedTraining:null,
+  closedTraining:null,activeChewer:storedChewerChoice(),
   deviceMotionGuardUntil:-Infinity,deviceMotionAllowed:false,deviceMotionSamples:0,
   resumePending: false, blockedPlayback: false, manualPaused: false, resumeRequestMs: 0, lastDetectedChewMs: -Infinity,
 };
@@ -418,6 +436,37 @@ function requestMotionGuard(){
     }).catch(()=>false);
   }catch{return Promise.resolve(false);}
 }
+// Select users manually: this is profile separation, never face identification.
+function chewerProfileMessage(){
+  const name=chewerName(state.activeChewer),p=detector.profile;
+  const msg=p?
+    'Mẫu riêng của '+name+': '+p.key+'. Giữ yên 3 giây khi đổi người để hiệu chỉnh.':
+    name+' chưa có mẫu nhai kín. Bấm Học nhai kín (10 giây) sau khi bật camera; không dùng mẫu nhai của người khác.';
+  $('chewerInfo').textContent=msg;$('trainClosedInfo').textContent=msg;
+}
+function useChewer(choice,{persist=true,resetCalibration=true}={}){
+  if(!chewerProfileKeys[choice])return false;
+  if(resetCalibration&&choice===state.activeChewer)return false;
+  if(persist){try{localStorage.setItem(chewerChoiceKey,choice);}catch{}}
+  state.activeChewer=choice;$('chewerSelect').value=choice;
+  state.closedTraining=null;
+  $('trainClosed').disabled=!state.tracking;
+  $('trainClosed').textContent='Học nhai kín miệng (10 giây)';
+  detector.profile=null;const p=profileForChewer(choice);
+  if(p)detector.setProfile(p);
+  detector.reset();
+  $('chewCount').textContent='0';$('chewMeter').style.width='0';
+  state.lastChewMs=null;state.lastDetectedChewMs=-Infinity;
+  if(state.tracking&&resetCalibration){
+    if($('autoControl').checked&&isPlaying()&&state.playedOnce){
+      state.pausedByChew=true;state.resumePending=false;pauseMedia();
+      playbackStatus('Đã đổi người: video tạm dừng để hiệu chỉnh camera.');
+    }
+    trackerStatus('Đã chọn '+chewerName(choice)+'. Giữ yên 3 giây để hiệu chỉnh trước khi nhai.');
+  }
+  chewerProfileMessage();
+  return true;
+}
 function note(s) { $('playerNote').textContent = s; }
 function trackerStatus(s) { $('trackingStatus').textContent=s; }
 function playbackStatus(s) { $('playbackStatus').textContent=s; }
@@ -429,6 +478,8 @@ function hideUnlock() { $('unlockPlayback').classList.add('hidden'); }
 function storeSettings(){
   try { localStorage.setItem(configKey, JSON.stringify({videoId:state.ytId, idle: Number($('idleSeconds').value), sensitivity:Number($('sensitivity').value), auto:$('autoControl').checked})); } catch{}
 }
+$('chewerSelect').value=state.activeChewer;
+useChewer(state.activeChewer,{persist:false,resetCalibration:false});
 function setSettings(){
   $('idleSeconds').value = Math.max(2, Math.min(10, Number(saved.idle)||4));
   $('sensitivity').value = Math.max(.6, Math.min(1.6, Number(saved.sensitivity)||1));
@@ -621,10 +672,7 @@ async function startTracking(){
     state.lastInferenceMs=0;state.modelLoading=false;
     $('cameraBadge').textContent='Đang hoạt động';$('cameraBadge').classList.add('active');
     $('stopCamera').disabled=false;$('trainClosed').disabled=false;
-    $('trainClosedInfo').textContent=detector.profile?.source==='diagnostic-20261102'?
-      'Đã áp dụng số đo iPhone: jaw (+), ngưỡng 0,011766; mẫu rightJawY lỗi được sao lưu. Thử nhai kín 10 lần, KHÔNG cần học lại.':
-      detector.profile?'Đã có mẫu nhai kín được học trên thiết bị. Có thể bấm để học lại.':
-      'Camera sẵn sàng. Bấm Học nhai kín miệng để ghi nhận chuyển động hàm thực tế (không lưu hình).';
+    chewerProfileMessage();
     $('trainClosedInfo').textContent+=state.deviceMotionAllowed?
       ' Chống rung cảm biến được cấp quyền.':' Chống rung hình ảnh đang bật; cảm biến chuyển động chưa được cấp quyền.';
     trackerStatus('Nhìn vào camera và giữ yên 3 giây…');
@@ -676,11 +724,14 @@ function detectLoop(session){
         else trackerStatus('Học nhai kín: nhai kín miệng liên tục '+remaining+' giây');
         if(elapsed>=9600){
           state.closedTraining=null;$('trainClosed').disabled=false;$('trainClosed').textContent='Học lại nhai kín (10 giây)';
-          const result=t.invalidMovement?
+          const result=t.who!==state.activeChewer?
+            {ok:false,reason:'Đã thay người trong lúc học. Không lưu mẫu.'}:
+            t.invalidMovement?
             {ok:false,reason:'Có rung máy trong lúc học. Mẫu hiện tại KHÔNG được lưu; đặt iPhone cố định rồi thử lại.'}:
             detector.learnClosedProfile(t.still,t.chewing);
           if(result.ok){
-            try{localStorage.setItem(closedProfileKey,JSON.stringify(result.profile));}catch{}
+            try{localStorage.setItem(chewerProfileKeys[state.activeChewer],JSON.stringify(result.profile));}catch{}
+            $('chewerInfo').textContent='Mẫu '+result.profile.key+' chỉ lưu cho '+chewerName(state.activeChewer)+'.';
             $('trainClosedInfo').textContent='Đã học từ '+result.profile.verifiedCycles+
               ' chu kỳ ước lượng qua tín hiệu '+result.profile.key+
               ' (không đếm nhầm lúc giữ yên). Không lưu ảnh; hãy kiểm thử 10 lần nhai thật.';
@@ -719,9 +770,10 @@ $('localPlayer').addEventListener('play',()=>{if(state.source==='local'){state.p
 $('localPlayer').addEventListener('pause',()=>{if(state.source==='local'&&!state.pausedByChew && !state.resumePending){state.playedOnce=false;state.manualPaused=true;}});
 $('localPlayer').addEventListener('ended',()=>{state.playedOnce=false;state.pausedByChew=false;});
 $('startCamera').addEventListener('click',startTracking);$('stopCamera').addEventListener('click',stopTracking);
+$('chewerSelect').addEventListener('change',()=>useChewer($('chewerSelect').value));
 $('trainClosed').addEventListener('click',()=>{
   if(!state.tracking || state.closedTraining)return;
-  state.closedTraining={start:performance.now(),still:[],chewing:[]};
+  state.closedTraining={start:performance.now(),still:[],chewing:[],who:state.activeChewer};
   $('trainClosed').disabled=true;
   $('trainClosedInfo').textContent='Giai đoạn 1: giữ mặt yên 2 giây. Sau đó nhai kín miệng bình thường trong 7 giây. Không cần há to.';
   trackerStatus('Bắt đầu học: giữ mặt yên 2 giây.');
