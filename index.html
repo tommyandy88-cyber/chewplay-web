@@ -207,13 +207,17 @@ class ChewDetector {
       const values=this.poseHistory.map(v=>v[key]).filter(Number.isFinite);
       return values.length<2?0:Math.max(...values)-Math.min(...values);
     };
-    const visualShake=poseRange('x')>.012||poseRange('y')>.012||
-      poseRange('roll')>.035||
-      poseRange('scale')/Math.max(m.headScale,.01)>.020||
-      poseRange('noseX')>.048||poseRange('noseY')>.052;
-    const perFrameShift=!!p && (Math.hypot(m.headX-p.headX,m.headY-p.headY)>.018||
-      Math.abs(m.headScale-p.headScale)/Math.max(m.headScale,.01)>.025);
-    const headShift=recoveredFace||perFrameShift||visualShake||m.deviceMoving===true;
+    // Slow head drift is common while children chew. The previous 0.012 pose
+    // range over 320ms kept extending the 850ms block indefinitely.
+    const frameDt=Math.max(25,Math.min(220,nowMs-(Number.isFinite(previousSeen)?previousSeen:nowMs-67)));
+    const poseSpeed=p?Math.hypot(m.headX-p.headX,m.headY-p.headY)/(frameDt/1000):0;
+    const rapidVisualShake=poseSpeed>.24||
+      poseRange('x')>.055||poseRange('y')>.055||
+      poseRange('roll')>.12||
+      poseRange('scale')/Math.max(m.headScale,.01)>.065||
+      poseRange('noseX')>.15||poseRange('noseY')>.15||
+      (!!p && Math.abs(m.headScale-p.headScale)/Math.max(m.headScale,.01)>.040);
+    const headShift=recoveredFace||rapidVisualShake||m.deviceMoving===true;
     if(headShift){
       this.motionGuardUntil=nowMs+850;
       // Rebase all motion channels after the phone/head moves. Do not treat
@@ -408,6 +412,7 @@ const state = {
   playedOnce: false, pausedByChew: false, modelLoading: false, videoWasPlaying: false,
   closedTraining:null,activeChewer:storedChewerChoice(),
   deviceMotionGuardUntil:-Infinity,deviceMotionAllowed:false,deviceMotionSamples:0,
+  lastDeviceMotionSampleMs:-Infinity,motionWeakEvents:[],
   resumePending: false, blockedPlayback: false, manualPaused: false, resumeRequestMs: 0, lastDetectedChewMs: -Infinity,
 };
 // Motion access is requested synchronously from the parent's Start Camera tap.
@@ -418,10 +423,16 @@ function onDeviceMotion(event){
     Math.hypot(obj.x,obj.y,obj.z):0;
   const rotation=rate&&[rate.alpha,rate.beta,rate.gamma].every(Number.isFinite)?
     Math.hypot(rate.alpha,rate.beta,rate.gamma):0;
-  const linear=norm(a),gravity=norm(g);
-  state.deviceMotionSamples++;
-  if(linear>.90||rotation>9||(gravity>0&&Math.abs(gravity-9.81)>1.4)){
-    state.deviceMotionGuardUntil=performance.now()+1000;
+  const linear=norm(a),gravity=norm(g),now=performance.now();
+  state.deviceMotionSamples++;state.lastDeviceMotionSampleMs=now;
+  // Reject strong shake immediately; smaller bumps must repeat to lock
+  // tracking. One minor hand adjustment must not suppress a child's chewing.
+  const strong=linear>3.0||rotation>38||(gravity>0&&Math.abs(gravity-9.81)>3.0);
+  const moderate=linear>1.35||rotation>17||(gravity>0&&Math.abs(gravity-9.81)>1.9);
+  state.motionWeakEvents=state.motionWeakEvents.filter(t=>now-t<280);
+  if(moderate)state.motionWeakEvents.push(now);
+  if(strong||state.motionWeakEvents.length>=3){
+    state.deviceMotionGuardUntil=Math.max(state.deviceMotionGuardUntil,now+850);
   }
 }
 function requestMotionGuard(){
@@ -692,6 +703,7 @@ function stopTracking(){
   state.tracking=false;state.trackerSession++;state.closedTraining=null;$('trainClosed').disabled=true;
   window.removeEventListener('devicemotion',onDeviceMotion);
   state.deviceMotionAllowed=false;state.deviceMotionGuardUntil=-Infinity;state.deviceMotionSamples=0;
+  state.lastDeviceMotionSampleMs=-Infinity;state.motionWeakEvents=[];
   for(const track of state.cameraStream?.getTracks()||[])track.stop();
   state.cameraStream=null;
   const preview=$('cameraPreview');preview.pause();preview.srcObject=null;
@@ -710,7 +722,11 @@ function detectLoop(session){
       const result=state.landmarker.detectForVideo(camera,now);
       const face=result.faceLandmarks?.[0];
       const measures=face?metricsFromFace(face):null;
-      if(measures)measures.deviceMoving=now<state.deviceMotionGuardUntil;
+      if(measures){
+        measures.deviceMoving=now<state.deviceMotionGuardUntil;
+        measures.motionSensorReady=state.deviceMotionSamples>=4 &&
+          now-state.lastDeviceMotionSampleMs<1500;
+      }
       if(state.closedTraining){
         const t=state.closedTraining,elapsed=now-t.start;
         if(measures){
