@@ -211,16 +211,32 @@ class ChewDetector {
       roll:m.headRoll,noseX:m.noseRelX,noseY:m.noseRelY
     };
     this.poseHistory.push(pose);
-    this.poseHistory=this.poseHistory.filter(v=>nowMs-v.t<=320);
+    this.poseHistory=this.poseHistory.filter(v=>nowMs-v.t<=480);
     const poseRange=key=>{
-      const values=this.poseHistory.map(v=>v[key]).filter(Number.isFinite);
+      const values=this.poseHistory.filter(v=>nowMs-v.t<=320).map(v=>v[key]).filter(Number.isFinite);
       return values.length<2?0:Math.max(...values)-Math.min(...values);
     };
     // Slow head drift is common while children chew. The previous 0.012 pose
     // range over 320ms kept extending the 850ms block indefinitely.
     const frameDt=Math.max(25,Math.min(220,nowMs-(Number.isFinite(previousSeen)?previousSeen:nowMs-67)));
     const poseSpeed=p?Math.hypot(m.headX-p.headX,m.headY-p.headY)/(frameDt/1000):0;
-    const rapidVisualShake=poseSpeed>.24||
+    // Rapid small phone shake reverses direction multiple times within 480ms.
+    // Children's slower head sway does not. This catches lắc máy with small
+    // displacement even when the per-frame pose speed stays below .24.
+    const poseReversals=key=>{
+      let sign=0,flips=0;
+      for(let i=1;i<this.poseHistory.length;i++){
+        const diff=this.poseHistory[i][key]-this.poseHistory[i-1][key];
+        if(!Number.isFinite(diff)||Math.abs(diff)<.0007)continue;
+        const next=Math.sign(diff);
+        if(sign&&next!==sign)flips++;
+        sign=next;
+      }
+      return flips;
+    };
+    const rapidOscillation=(poseReversals('x')>=2&&poseRange('x')>.006)||
+      (poseReversals('y')>=2&&poseRange('y')>.006);
+    const rapidVisualShake=rapidOscillation||poseSpeed>.24||
       poseRange('x')>.055||poseRange('y')>.055||
       poseRange('roll')>.12||
       poseRange('scale')/Math.max(m.headScale,.01)>.065||
@@ -423,6 +439,7 @@ const state = {
   deviceMotionGuardUntil:-Infinity,deviceMotionAllowed:false,deviceMotionSamples:0,
   lastDeviceMotionSampleMs:-Infinity,motionWeakEvents:[],
   resumePending: false, blockedPlayback: false, manualPaused: false, resumeRequestMs: 0, lastDetectedChewMs: -Infinity,
+  chewEvents:[],
 };
 // Motion access is requested synchronously from the parent's Start Camera tap.
 // No accelerometer/gyroscope data leaves the device or is saved.
@@ -476,7 +493,7 @@ function useChewer(choice,{persist=true,resetCalibration=true}={}){
   if(p)detector.setProfile(p);
   detector.reset();
   $('chewCount').textContent='0';$('chewMeter').style.width='0';
-  state.lastChewMs=null;state.lastDetectedChewMs=-Infinity;
+  state.lastChewMs=null;state.lastDetectedChewMs=-Infinity;state.chewEvents=[];
   if(state.tracking&&resetCalibration){
     if($('autoControl').checked&&isPlaying()&&state.playedOnce){
       state.pausedByChew=true;state.resumePending=false;pauseMedia();
@@ -617,8 +634,18 @@ function runChewControl(now){
 function onChew(now){
   $('chewCount').textContent=String(detector.chews);
   state.lastDetectedChewMs=now;state.lastChewMs=now;
-  playbackStatus('Đã nhận diện '+detector.chews+' lần nhai. '+(state.pausedByChew?'Đang yêu cầu phát video...':'Video đang được theo dõi.'));
+  state.chewEvents.push(now);
+  state.chewEvents=state.chewEvents.filter(t=>now-t<=2500);
+  // A single motion artifact must never restart a paused video. Require two
+  // independent rhythmic chewing peaks after the previous idle interval.
+  const confirmedRhythm=state.chewEvents.length>=2 &&
+    state.chewEvents.at(-1)-state.chewEvents.at(-2)>=240;
+  playbackStatus('Đã nhận diện '+detector.chews+' lần nhai. '+
+    ((state.pausedByChew||!state.playedOnce) && !confirmedRhythm ?
+      'Cần thêm một nhịp nhai để xác nhận trước khi phát.':
+      state.pausedByChew?'Đang yêu cầu phát video...':'Video đang được theo dõi.'));
   if(!$('autoControl').checked)return;
+  if((state.pausedByChew||!state.playedOnce)&&!confirmedRhythm)return;
   if(state.pausedByChew && state.playedOnce && !state.resumePending){
     // Keep pausedByChew until PLAYING event; asynchronous PAUSED may arrive late.
     resumeMedia();
@@ -688,7 +715,7 @@ async function startTracking(){
     if(!state.landmarker){state.landmarker=await loadFaceLandmarker(report);}
     detector.reset();detector.setSensitivity($('sensitivity').value);
     $('chewCount').textContent='0';$('chewMeter').style.width='0';
-    state.lastChewMs=null;state.tracking=true;state.trackerSession++;
+    state.lastChewMs=null;state.chewEvents=[];state.tracking=true;state.trackerSession++;
     state.lastInferenceMs=0;state.modelLoading=false;
     $('cameraBadge').textContent='Đang hoạt động';$('cameraBadge').classList.add('active');
     $('stopCamera').disabled=false;$('trainClosed').disabled=false;
@@ -719,7 +746,7 @@ function stopTracking(){
   $('cameraBlank').classList.remove('hidden');
   $('cameraBadge').textContent='Đã dừng';$('cameraBadge').classList.remove('active');
   $('startCamera').disabled=false;$('stopCamera').disabled=true;
-  state.lastChewMs=null;state.pausedByChew=false;
+  state.lastChewMs=null;state.chewEvents=[];state.pausedByChew=false;
   trackerStatus('Camera đã tắt');$('chewMeter').style.width='0';
 }
 function detectLoop(session){
