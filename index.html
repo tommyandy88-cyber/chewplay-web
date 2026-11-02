@@ -154,7 +154,7 @@ class ChewDetector {
     this.motionGuardUntil=-Infinity;this.poseHistory=[];
     // A person-specific profile is retained across reset; the camera image is never persisted.
     this.personalBaseline=null;this.personalSmoothed=0;this.personalArmed=true;
-    this.personalLastTime=null;
+    this.personalLastTime=null;this.autoProfile=null;
   }
   setSensitivity(value) { this.sensitivity=clamp(Number(value)||1,.6,1.6); }
   update(m, nowMs) {
@@ -186,6 +186,15 @@ class ChewDetector {
         this.closedThreshold=clamp(Math.max(.0028,quantile(closedNoise,.95)*2.2),.0028,.045);
         const noise=this.restFrames.map(v=>this.movement(v));
         this.threshold=clamp(Math.max(.017,quantile(noise,.95)*2.8),.017,.14);
+        // An untrained child still needs an immediately usable detector.
+        // Calibrate a conservative provisional jaw channel using resting noise.
+        // This is NOT saved as a personal profile or treated as trained KNN.
+        const jawValues=this.restFrames.map(x=>x.jaw).filter(Number.isFinite);
+        const jawCenter=quantile(jawValues,.5);
+        const jawNoise=quantile(jawValues.map(v=>Math.abs(v-jawCenter)),.95);
+        this.autoProfile={key:'jaw',polarity:1,
+          threshold:clamp(Math.max(.0055,jawNoise*2.6),.0055,.045),
+          source:'temporary-rest-calibration',version:2};
         this.ready=true; this.previous=m;this.poseHistory=[];
       }
       return {face:true,ready:this.ready,calibrating:!this.ready,
@@ -254,9 +263,9 @@ class ChewDetector {
     // from the unrelated generic detector. Consume the personalized edge ONLY if
     // the cycle was actually counted (cooldown or head-motion guard may block it).
     const personal=this.personalClosedSignal(m,nowMs,!headShift);
-    const personalHit=!!this.profile && personal.detected;
-    const genericOpenHit=!this.profile && !this.above && openExceeded;
-    const genericClosedHit=!this.profile && !this.closedAbove && closedExceeded;
+    const personalHit=!!(this.profile||this.autoProfile) && personal.detected;
+    const genericOpenHit=!(this.profile||this.autoProfile) && !this.above && openExceeded;
+    const genericClosedHit=!(this.profile||this.autoProfile) && !this.closedAbove && closedExceeded;
     let chewed=false,kind=null;
     if(!stable){
       this.above=openExceeded;
@@ -331,7 +340,7 @@ class ChewDetector {
     return true;
   }
   personalClosedSignal(m,nowMs,stable){
-    const profile=this.profile;
+    const profile=this.profile||this.autoProfile;
     if(!profile || !Number.isFinite(m[profile.key]) || !stable)return {detected:false,rearmed:false};
     const value=m[profile.key];
     if(this.personalBaseline===null){this.personalBaseline=value;this.personalLastTime=nowMs;return {detected:false,rearmed:false};}
@@ -762,7 +771,7 @@ function detectLoop(session){
         if(state.lastChewMs===null && state.playedOnce)state.lastChewMs=now;
         trackerStatus(info.headShift?'Đang rung máy hoặc di chuyển đầu — KHÔNG tính là nhai':
           info.chewed?(info.kind==='closed'?'Đã nhận diện nhai kín miệng':'Đã nhận diện một lần nhai'):
-          detector.profile?'Đang theo dõi nhai kín theo mẫu đã học':'Đang theo dõi chuyển động nhai — có thể bấm Học nhai kín');
+          detector.profile?'Đang theo dõi nhai kín theo mẫu đã học':'Đang theo dõi nhai bằng hiệu chỉnh tạm thời; nên học mẫu riêng nếu bé bị bỏ sót');
         $('chewMeter').style.width=Math.min(100,Math.max(0,(info.score||0)/Math.max(info.threshold,.001)*55))+'%';
         if(info.chewed)onChew(now);
       }
