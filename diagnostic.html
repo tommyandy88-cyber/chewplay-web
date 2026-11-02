@@ -68,8 +68,10 @@ function metricsFromFace(points) {
 
 const $ = id => document.getElementById(id);
 const keys=['chinZ','lipZ','leftJawZ','rightJawZ','leftCornerZ','rightCornerZ','chinY','leftJawY','rightJawY','jaw','gap','lip','cornerL','cornerR','lowerL','lowerR','jawSpan','cheekSpan'];
-const saved=(()=>{try{return JSON.parse(localStorage.getItem('chewplay-web-closed-personal-v1')||'null')}catch{return null}})();
-$('loaded').textContent=saved && saved.key ? 'Mẫu đã học đang lưu: '+saved.key+' · ngưỡng '+Number(saved.threshold).toFixed(5) : 'Không tìm thấy mẫu nhai kín đã lưu trên Safari này.';
+const activeChewer=(()=>{try{const v=localStorage.getItem('chewplay-web-active-chewer-v1');return ['child1','child2','child3'].includes(v)?v:'adult';}catch{return 'adult'}})();
+const profileKey=activeChewer==='adult'?'chewplay-web-closed-personal-v1':'chewplay-web-closed-'+activeChewer+'-v1';
+const saved=(()=>{try{return JSON.parse(localStorage.getItem(profileKey)||'null')}catch{return null}})();
+$('loaded').textContent=saved && saved.key ? 'Mẫu đang lưu cho '+(activeChewer==='adult'?'Tôi':'Bé '+activeChewer.slice(-1))+': '+saved.key+' · ngưỡng '+Number(saved.threshold).toFixed(5) : 'Chưa có mẫu riêng cho '+(activeChewer==='adult'?'Tôi':'Bé '+activeChewer.slice(-1))+'.';
 const start=$('start'),status=$('status'),camera=$('camera');
 let stream=null,landmarker=null,active=false,frames=[],faceMissing=0,inferenceFailed=0,lastInfer=0,firstFace=null;
 function stat(s){status.textContent=s;}
@@ -120,6 +122,7 @@ function summarize(){
       ', missingFace='+faceMissing+', inferenceErrors='+inferenceFailed,
     'EffectiveFPS='+(duration>0?(frames.length/duration).toFixed(1):'0')+
       ', headShiftFrames='+moved,
+    'ActiveChewer='+activeChewer,
     'StoredProfile='+(saved?.key||'none')+
       ', polarity='+(saved?.polarity??'n/a')+
       ', threshold='+(Number.isFinite(saved?.threshold)?Number(saved.threshold).toFixed(6):'n/a'),
